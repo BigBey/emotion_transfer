@@ -83,6 +83,34 @@ def prepare_generator_input(img, landmarks, sigma=2):
 
     return img, landmarks
 
+def get_emotion_path(emotion):
+    emotions_path = '../emotions/'
+    emotions = {
+        'com' : 'comfortable',
+        'hap' : 'happy',
+        'ins' : 'inspirational',
+        'joy' : 'joy',
+        'lon' : 'lonely',
+        'fun' : 'funny',
+        'nos' : 'nostalgic',
+        'pas' : 'passionate',
+        'qui' : 'quiet',
+        'rel' : 'relaxed',
+        'rom' : 'romantic',
+        'sad' : 'sadness',
+        'sou' : 'soulful',
+        'swe' : 'sweet',
+        'ser' : 'serious',
+        'ang' : 'anger',
+        'war' : 'wary',
+        'sur' : 'surprise',
+        'fea' : 'fear'
+    }
+    if emotion in emotions:
+        return emotions_path + emotions[emotion] + '/' + emotions[emotion] + '_man.jpg'
+    else:
+        return None
+
 
 def main(source_path, target_path,
          arch='res_unet_split.MultiScaleResUNet(in_nc=71,out_nc=(3,3),flat_layers=(2,0,2,3),ngf=128)',
@@ -132,85 +160,32 @@ def main(source_path, target_path,
     for i in range(len(source_tensor)):
         source_tensor[i] = source_tensor[i].to(device)
 
-    # Extract landmarks and bounding boxes from target video
-    frame_indices, landmarks, bboxes, eulers = extract_landmarks_bboxes_euler_from_video(target_path, Gp, device=device)
-    if frame_indices.size == 0:
-        raise RuntimeError('No faces were detected in the target video: ' + target_path)
+    # Process target image
+    target_bgr = cv2.imread(target_path)
+    target_rgb = target_bgr[:, :, ::-1]
+    target_landmarks, target_bbox = process_image(fa, target_rgb, crop_size)
+    if target_bbox is None:
+        raise RuntimeError("Couldn't detect a face in target image: " + target_path)
+    target_tensor, target_landmarks, target_bbox = img_transforms2(target_rgb, target_landmarks, target_bbox)
 
-    # Open target video file
-    cap = cv2.VideoCapture(target_path)
-    if not cap.isOpened():
-        raise RuntimeError('Failed to read video: ' + target_path)
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    fps = cap.get(cv2.CAP_PROP_FPS)
+    input_tensor = []
+    for j in range(len(source_tensor)):
+        target_landmarks[j] = target_landmarks[j].to(device)
+        input_tensor.append(torch.cat((source_tensor[j], target_landmarks[j]), dim=0).unsqueeze(0).to(device))
+    out_img_tensor, out_seg_tensor = G(input_tensor)
 
-    # Initialize output video file
-    if output_path is not None:
-        if os.path.isdir(output_path):
-            output_filename = os.path.splitext(os.path.basename(source_path))[0] + '_' + \
-                              os.path.splitext(os.path.basename(target_path))[0] + '.mp4'
-            output_path = os.path.join(output_path, output_filename)
-        fourcc = cv2.VideoWriter_fourcc(*'avc1')
-        out_vid = cv2.VideoWriter(output_path, fourcc, fps,
-                                  (source_cropped_bgr.shape[1]*3, source_cropped_bgr.shape[0]))
-    else:
-        out_vid = None
+    # Convert back to numpy images
+    out_img_bgr = tensor2bgr(out_img_tensor)
+    frame_cropped_bgr = tensor2bgr(target_tensor[0])
 
-    # For each frame in the target video
-    valid_frame_ind = 0
-    for i in tqdm(range(total_frames)):
-        ret, frame = cap.read()
-        if frame is None:
-            continue
-        if i not in frame_indices:
-            continue
-        frame_rgb = frame[:, :, ::-1]
-        frame_tensor, frame_landmarks, frame_bbox = img_transforms2(frame_rgb, landmarks[valid_frame_ind],
-                                                                    bboxes[valid_frame_ind])
-        valid_frame_ind += 1
+    # Render
+    render_img = np.concatenate((source_cropped_bgr, out_img_bgr, frame_cropped_bgr), axis=1)
 
-        # frame_cropped_rgb, frame_landmarks = process_cached_frame(frame_rgb, landmarks[valid_frame_ind],
-        #                                                           bboxes[valid_frame_ind], size)
-        # frame_cropped_bgr = frame_cropped_rgb[:, :, ::-1].copy()
-        # valid_frame_ind += 1
-
-        #
-        # frame_tensor, frame_landmarks_tensor = prepare_generator_input(frame_cropped_rgb, frame_landmarks)
-        # frame_landmarks_tensor.to(device)
-        input_tensor = []
-        for j in range(len(source_tensor)):
-            frame_landmarks[j] = frame_landmarks[j].to(device)
-            input_tensor.append(torch.cat((source_tensor[j], frame_landmarks[j]), dim=0).unsqueeze(0).to(device))
-        out_img_tensor, out_seg_tensor = G(input_tensor)
-
-        # Transfer image1 mask to image2
-        # face_mask_tensor = out_seg_tensor.argmax(1) == 1  # face
-        # face_mask_tensor = out_seg_tensor.argmax(1) == 2    # hair
-        # face_mask_tensor = out_seg_tensor.argmax(1) >= 1  # head
-
-        # target_img_tensor = frame_tensor[0].view(1, frame_tensor[0].shape[0],
-        #                                          frame_tensor[0].shape[1], frame_tensor[0].shape[2]).to(device)
-
-        # Convert back to numpy images
-        out_img_bgr = tensor2bgr(out_img_tensor)
-        frame_cropped_bgr = tensor2bgr(frame_tensor[0])
-
-        # Render
-        # for point in np.round(frame_landmarks).astype(int):
-        #     cv2.circle(frame_cropped_bgr, (point[0], point[1]), 2, (0, 0, 255), -1)
-        render_img = np.concatenate((source_cropped_bgr, out_img_bgr, frame_cropped_bgr), axis=1)
-        if out_vid is not None:
-            out_vid.write(render_img)
-        if out_vid is None or display:
-            cv2.imshow('render_img', render_img)
-            if cv2.waitKey(1) & 0xFF == ord('q'):
-                break
-
-    # for point in np.round(source_landmarks).astype(int):
-    #     cv2.circle(source_cropped_bgr, (point[0], point[1]), 2, (0, 0, 255), -1)
-    # cv2.imshow('frame', source_cropped_bgr)
-    # cv2.waitKey(0)
-
+    # Output
+    output_name = '_'.join([os.path.splitext(os.path.basename(source_path))[0],
+                                 os.path.splitext(os.path.basename(target_path))[0]]) + '.jpg'
+    output_path = os.path.join(output_path, output_name)
+    cv2.imwrite(output_path, render_img)
 
 if __name__ == "__main__":
     # Parse program arguments
@@ -218,8 +193,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser('reenactment')
     parser.add_argument('source', metavar='IMAGE',
                         help='path to source image')
-    parser.add_argument('-t', '--target', type=str, metavar='VIDEO',
-                        help='paths to target video')
+    parser.add_argument('-e', '--emotion', type=str, metavar='IMAGE',
+                        help='emotion, which can be on source face')
     parser.add_argument('-a', '--arch',
                         default='res_unet_split.MultiScaleResUNet(in_nc=71,out_nc=(3,3),flat_layers=(2,0,2,3),ngf=128)',
                         help='model architecture object')
@@ -246,5 +221,9 @@ if __name__ == "__main__":
     parser.add_argument('-d', '--display', action='store_true',
                         help='display the rendering')
     args = parser.parse_args()
-    main(args.source, args.target, args.arch, args.model, args.pose_model, args.pil_transforms1, args.pil_transforms2,
-         args.tensor_transforms1, args.tensor_transforms2, args.output, args.crop_size, args.display)
+
+    if get_emotion_path(args.emotion) == None:
+        print('ERROR: This emotion is unavailable.')
+    else:
+        main(args.source, get_emotion_path(args.emotion), args.arch, args.model, args.pose_model, args.pil_transforms1, args.pil_transforms2,
+             args.tensor_transforms1, args.tensor_transforms2, args.output, args.crop_size, args.display)
